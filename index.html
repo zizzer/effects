@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trail</title>
+<style>
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #080810; }
+  canvas { position: fixed; inset: 0; display: block; }
+  #hint {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    color: rgba(255,255,255,0.18);
+    letter-spacing: 0.08em;
+    pointer-events: none;
+    user-select: none;
+    transition: opacity 2s ease;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="far"></canvas>
+<canvas id="mid"></canvas>
+<canvas id="trail"></canvas>
+<div id="hint">move · touch · tilt</div>
+
+<script>
+(() => {
+  const farCanvas   = document.getElementById('far');
+  const midCanvas   = document.getElementById('mid');
+  const trailCanvas = document.getElementById('trail');
+  const fCtx = farCanvas.getContext('2d');
+  const mCtx = midCanvas.getContext('2d');
+  const tCtx = trailCanvas.getContext('2d');
+  const hint = document.getElementById('hint');
+
+  let W, H;
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    farCanvas.width = midCanvas.width = trailCanvas.width = W;
+    farCanvas.height = midCanvas.height = trailCanvas.height = H;
+  }
+
+  // Three layers of stars at different depths
+  // far = tiny, slow; mid = medium, medium; near = rendered on mid canvas, bigger
+  const layers = [
+    { canvas: farCanvas,  ctx: fCtx, count: 160, rMin: 0.2, rMax: 0.7,  aMin: 0.08, aMax: 0.3,  parallax: 0.018 },
+    { canvas: midCanvas,  ctx: mCtx, count: 80,  rMin: 0.7, rMax: 1.4,  aMin: 0.2,  aMax: 0.55, parallax: 0.042 },
+    { canvas: midCanvas,  ctx: mCtx, count: 30,  rMin: 1.4, rMax: 2.4,  aMin: 0.4,  aMax: 0.8,  parallax: 0.08  },
+  ];
+
+  const allStars = layers.flatMap(l =>
+    Array.from({ length: l.count }, () => ({
+      x: Math.random(), y: Math.random(),
+      r: l.rMin + Math.random() * (l.rMax - l.rMin),
+      a: l.aMin + Math.random() * (l.aMax - l.aMin),
+      ts: Math.random() * 0.015 + 0.003,
+      tp: Math.random() * Math.PI * 2,
+      ctx: l.ctx,
+      parallax: l.parallax
+    }))
+  );
+
+  // --- Smooth tilt state ---
+  // We smooth the raw sensor with a low-pass filter BEFORE lerping,
+  // then lerp the visual position for additional smoothness.
+  let rawX = 0, rawY = 0;       // low-pass filtered sensor value
+  let smoothX = 0, smoothY = 0; // visual lerp target
+  let tiltX = 0, tiltY = 0;     // actual rendered value
+
+  const SENSOR_SMOOTH = 0.12;   // low-pass on raw sensor (higher = more responsive, less smooth)
+  const VISUAL_LERP   = 0.035;  // visual lerp (lower = silkier, more lag)
+  const MAX_SHIFT     = 90;     // px of parallax travel at max tilt
+  const SCALE         = 1.15;   // canvas scale to hide edges during shift
+
+  let motionActive = false;
+
+  function applyTilt() {
+    smoothX += (rawX - smoothX) * VISUAL_LERP;
+    smoothY += (rawY - smoothY) * VISUAL_LERP;
+
+    tiltX = smoothX;
+    tiltY = smoothY;
+  }
+
+  // Mouse parallax for desktop
+  window.addEventListener('mousemove', e => {
+    if (motionActive) return;
+    rawX = (e.clientX / W - 0.5) * 2;
+    rawY = (e.clientY / H - 0.5) * 2;
+  });
+
+  // --- Device orientation ---
+  let baseGamma = null, baseBeta = null;
+  let calibBuf = [];
+  let gotEvent = false;
+
+  function handleOrientation(e) {
+    const gamma = e.gamma;
+    const beta  = e.beta;
+    if (gamma === null || beta === null) return;
+
+    if (baseGamma === null) {
+      calibBuf.push({ gamma, beta });
+      if (calibBuf.length < 10) return;
+      baseGamma = calibBuf.reduce((s, r) => s + r.gamma, 0) / calibBuf.length;
+      baseBeta  = calibBuf.reduce((s, r) => s + r.beta,  0) / calibBuf.length;
+      calibBuf  = [];
+    }
+
+    const dx = (gamma - baseGamma) / 35;
+    const dy = (beta  - baseBeta)  / 35;
+
+    // Low-pass filter on the raw sensor reading
+    rawX += ((Math.max(-1, Math.min(1, dx))) - rawX) * SENSOR_SMOOTH;
+    rawY += ((Math.max(-1, Math.min(1, dy))) - rawY) * SENSOR_SMOOTH;
+    motionActive = true;
+  }
+
+  // Double-tap recalibrate
+  let lastTap = 0;
+  window.addEventListener('touchend', () => {
+    const now = Date.now();
+    if (now - lastTap < 300) {
+      baseGamma = null; baseBeta = null; calibBuf = [];
+      rawX = 0; rawY = 0;
+    }
+    lastTap = now;
+  }, { passive: true });
+
+  function onAbsolute(e) {
+    if (!gotEvent) gotEvent = true;
+    handleOrientation(e);
+  }
+  window.addEventListener('deviceorientationabsolute', onAbsolute, { passive: true });
+  setTimeout(() => {
+    if (!gotEvent) window.addEventListener('deviceorientation', handleOrientation, { passive: true });
+  }, 600);
+
+  // --- Trail particles ---
+  const particles = [];
+  const PALETTE = [
+    [160,100,255],[80,160,255],[255,100,200],[100,220,255],[255,200,80]
+  ];
+
+  function addParticle(x, y, vx, vy, isTouch) {
+    const [r, g, b] = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+    const size = isTouch ? Math.random() * 14 + 6 : Math.random() * 9 + 3;
+    particles.push({
+      x, y,
+      vx: vx * (Math.random() * 0.4 + 0.2) + (Math.random() - 0.5) * 1.2,
+      vy: vy * (Math.random() * 0.4 + 0.2) + (Math.random() - 0.5) * 1.2,
+      r: size, maxR: size, life: 1,
+      decay: Math.random() * 0.018 + 0.012,
+      cr: r, cg: g, cb: b,
+      trail: [],
+      shape: Math.random() < 0.35 ? 'star' : 'circle'
+    });
+  }
+
+  function drawStar5(ctx, x, y, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 5; i++) {
+      const a  = (i * 4 * Math.PI) / 5 - Math.PI / 2;
+      const ia = a + Math.PI / 5;
+      if (i === 0) ctx.moveTo(x + r * Math.cos(a), y + r * Math.sin(a));
+      else         ctx.lineTo(x + r * Math.cos(a), y + r * Math.sin(a));
+      ctx.lineTo(x + r * 0.45 * Math.cos(ia), y + r * 0.45 * Math.sin(ia));
+    }
+    ctx.closePath();
+  }
+
+  let lastX = null, lastY = null, lastPTime = 0;
+  function onPointer(x, y, isTouch) {
+    const now = performance.now();
+    if (lastX !== null) {
+      const dt   = Math.max(now - lastPTime, 1);
+      const vx   = (x - lastX) / dt * 6;
+      const vy   = (y - lastY) / dt * 6;
+      const dist = Math.hypot(x - lastX, y - lastY);
+      const n    = isTouch ? Math.floor(dist / 8) + 2 : Math.floor(dist / 12) + 1;
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        addParticle(
+          lastX + (x - lastX) * t + (Math.random() - 0.5) * 4,
+          lastY + (y - lastY) * t + (Math.random() - 0.5) * 4,
+          vx, vy, isTouch
+        );
+      }
+    }
+    lastX = x; lastY = y; lastPTime = now;
+  }
+
+  window.addEventListener('mousemove', e => onPointer(e.clientX, e.clientY, false));
+  window.addEventListener('touchmove', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) onPointer(t.clientX, t.clientY, true);
+  }, { passive: false });
+  window.addEventListener('touchstart', e => {
+    for (const t of e.changedTouches) {
+      lastX = t.clientX; lastY = t.clientY; lastPTime = performance.now();
+    }
+  }, { passive: true });
+
+  const ripples = [];
+  function addRipple(x, y) {
+    const [r,g,b] = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+    ripples.push({ x, y, r: 0, life: 1, cr:r, cg:g, cb:b });
+  }
+  window.addEventListener('click', e => addRipple(e.clientX, e.clientY));
+  window.addEventListener('touchend', e => {
+    for (const t of e.changedTouches) addRipple(t.clientX, t.clientY);
+  }, { passive: true });
+
+  // --- Main loop ---
+  function loop() {
+    requestAnimationFrame(loop);
+
+    applyTilt();
+
+    const t = performance.now() * 0.001;
+
+    // Clear star canvases
+    fCtx.clearRect(0, 0, W, H);
+    mCtx.clearRect(0, 0, W, H);
+
+    // Draw each star shifted by its parallax depth * current tilt
+    for (const s of allStars) {
+      const tw  = 0.5 + 0.5 * Math.sin(t * s.ts * 60 + s.tp);
+      const ox  = tiltX * MAX_SHIFT * s.parallax * 10;
+      const oy  = tiltY * MAX_SHIFT * s.parallax * 10;
+      const px  = ((s.x * W + ox) % W + W) % W;
+      const py  = ((s.y * H + oy) % H + H) % H;
+
+      s.ctx.beginPath();
+      s.ctx.arc(px, py, s.r, 0, Math.PI * 2);
+      s.ctx.fillStyle = `rgba(255,255,255,${s.a * tw})`;
+      s.ctx.fill();
+    }
+
+    // Trail canvas
+    tCtx.clearRect(0, 0, W, H);
+
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const rp = ripples[i];
+      rp.r += 3.5; rp.life -= 0.022;
+      if (rp.life <= 0) { ripples.splice(i, 1); continue; }
+      tCtx.beginPath();
+      tCtx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
+      tCtx.strokeStyle = `rgba(${rp.cr},${rp.cg},${rp.cb},${rp.life * 0.6})`;
+      tCtx.lineWidth = 1.5;
+      tCtx.stroke();
+      tCtx.beginPath();
+      tCtx.arc(rp.x, rp.y, rp.r * 0.55, 0, Math.PI * 2);
+      tCtx.strokeStyle = `rgba(${rp.cr},${rp.cg},${rp.cb},${rp.life * 0.25})`;
+      tCtx.lineWidth = 0.8;
+      tCtx.stroke();
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.trail.push({ x: p.x, y: p.y });
+      if (p.trail.length > 6) p.trail.shift();
+      p.x += p.vx; p.y += p.vy;
+      p.vx *= 0.94; p.vy *= 0.94; p.vy += 0.06;
+      p.life -= p.decay;
+      p.r = p.maxR * p.life;
+      if (p.life <= 0 || p.r < 0.3) { particles.splice(i, 1); continue; }
+
+      if (p.trail.length > 1) {
+        tCtx.beginPath();
+        tCtx.moveTo(p.trail[0].x, p.trail[0].y);
+        for (let j = 1; j < p.trail.length; j++) tCtx.lineTo(p.trail[j].x, p.trail[j].y);
+        tCtx.strokeStyle = `rgba(${p.cr},${p.cg},${p.cb},${p.life * 0.3})`;
+        tCtx.lineWidth = p.r * 0.5;
+        tCtx.lineCap = 'round';
+        tCtx.stroke();
+      }
+
+      const grd = tCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * 2.2);
+      grd.addColorStop(0, `rgba(${p.cr},${p.cg},${p.cb},${p.life * 0.35})`);
+      grd.addColorStop(1, `rgba(${p.cr},${p.cg},${p.cb},0)`);
+      tCtx.beginPath();
+      tCtx.arc(p.x, p.y, p.r * 2.2, 0, Math.PI * 2);
+      tCtx.fillStyle = grd;
+      tCtx.fill();
+
+      tCtx.beginPath();
+      if (p.shape === 'star') drawStar5(tCtx, p.x, p.y, p.r);
+      else tCtx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      tCtx.fillStyle = `rgba(${p.cr},${p.cg},${p.cb},${Math.min(1, p.life * 1.4)})`;
+      tCtx.fill();
+    }
+  }
+
+  setTimeout(() => { hint.style.opacity = '0'; }, 3500);
+  window.addEventListener('resize', resize);
+  resize();
+  loop();
+})();
+</script>
+</body>
+</html>
